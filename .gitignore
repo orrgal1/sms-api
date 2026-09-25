@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+*.log
+*.plist
+build/
+dist/
+*.egg-info/
+sms_forwarder.sqlite3
+sms_forwarder.sqlite3-shm
+sms_forwarder.sqlite3-wal

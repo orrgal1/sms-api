@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macos-messages-email-forwarder"
+version = "0.1.0"
+description = "Forward incoming Apple Messages to email from a local macOS service."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+license = { file = "LICENSE" }
+authors = [{ name = "macOS Messages Email Forwarder contributors" }]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
+
+[tool.setuptools]
+py-modules = [
+  "config",
+  "configure",
+  "gmail_sender",
+  "main",
+  "messages_reader",
+  "models",
+  "service",
+  "state_store",
+  "worker",
+]
