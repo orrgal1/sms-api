@@ -1,4 +1,4 @@
-"""Read incoming message metadata from Apple's Messages database."""
+"""Read message text and metadata from Apple's Messages database."""
 
 from __future__ import annotations
 
@@ -6,10 +6,6 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
-
-
-from models import Attachment, SmsMessage
-
 
 _APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 _TYPEDSTREAM_MARKER = b"NSString"
@@ -64,7 +60,7 @@ def _decode_typedstream_string(blob: bytes | bytearray | memoryview | None) -> s
 
 
 class MessagesReader:
-    """Read eligible incoming message rows without opening attachment files."""
+    """Read eligible message rows without opening attachment files."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path).expanduser()
@@ -86,86 +82,81 @@ class MessagesReader:
             row = db.execute("SELECT COALESCE(MAX(ROWID), 0) FROM message").fetchone()
             return int(row[0] or 0)
 
-    def read_after(self, rowid: int, limit: int) -> list[SmsMessage]:
-        if limit <= 0:
-            return []
+    def list_messages(
+        self,
+        *,
+        limit: int = 50,
+        before: int | None = None,
+        query: str | None = None,
+        sender: str | None = None,
+        service: str | None = None,
+        direction: str = "incoming",
+    ) -> tuple[list[dict], int | None]:
+        """Return newest matching Messages rows and a cursor for the next page.
+
+        Search runs after decoding attributedBody, since many macOS messages have
+        no plain ``text`` column. Both the source database and attachments stay
+        read-only; attachment file contents are never opened.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if before is not None and before <= 0:
+            raise ValueError("before must be positive")
+        if direction not in {"incoming", "outgoing", "all"}:
+            raise ValueError("invalid direction")
+
+        needle = query.casefold() if query else None
+        found: list[dict] = []
+        cursor = before
         with closing(self._connect()) as db:
             columns = self._columns(db, "message")
             guid_expr = "m.guid" if "guid" in columns else "CAST(m.ROWID AS TEXT)"
             attributed_expr = "m.attributedBody" if "attributedBody" in columns else "NULL"
-            system_expr = "COALESCE(m.is_system_message, 0) = 0" if "is_system_message" in columns else "1"
-            service_expr = "COALESCE(m.is_service_message, 0) = 0" if "is_service_message" in columns else "1"
-            rows = db.execute(
-                f"""
-                SELECT m.ROWID, {guid_expr}, m.service, h.id, m.date, m.text, {attributed_expr}
-                  FROM message AS m
-                  LEFT JOIN handle AS h ON h.ROWID = m.handle_id
-                 WHERE m.ROWID > ?
-                   AND m.is_from_me = 0
-                   AND {system_expr}
-                   AND {service_expr}
-                 ORDER BY m.ROWID ASC
-                 LIMIT ?
-                """,
-                (rowid, limit),
-            ).fetchall()
-            if not rows:
-                return []
-
-            row_ids = [int(item[0]) for item in rows]
-            placeholders = ",".join("?" for _ in row_ids)
-            attachment_columns = self._columns(db, "attachment")
-            attachment_guid = "a.guid" if "guid" in attachment_columns else "NULL"
-            filename = "a.filename" if "filename" in attachment_columns else "NULL"
-            transfer_name = "a.transfer_name" if "transfer_name" in attachment_columns else "NULL"
-            mime_type = "a.mime_type" if "mime_type" in attachment_columns else "NULL"
-            uti = "a.uti" if "uti" in attachment_columns else "NULL"
-            total_bytes = "a.total_bytes" if "total_bytes" in attachment_columns else "NULL"
-            attachment_rows = db.execute(
-                f"""
-                SELECT j.message_id, a.ROWID, {attachment_guid}, {filename},
-                       {transfer_name}, {mime_type}, {uti}, {total_bytes}
-                  FROM message_attachment_join AS j
-                  JOIN attachment AS a ON a.ROWID = j.attachment_id
-                 WHERE j.message_id IN ({placeholders})
-                 ORDER BY a.ROWID ASC
-                """,
-                row_ids,
-            ).fetchall()
-
-        attachments: dict[int, list[Attachment]] = {message_id: [] for message_id in row_ids}
-        for message_id, _attachment_rowid, guid, filename, transfer_name, mime_type, uti, total_bytes in attachment_rows:
-            attachments[int(message_id)].append(
-                Attachment(
-                    guid=str(guid) if guid is not None else None,
-                    filename=str(filename) if filename is not None else None,
-                    transfer_name=str(transfer_name) if transfer_name is not None else None,
-                    mime_type=str(mime_type) if mime_type is not None else None,
-                    uti=str(uti) if uti is not None else None,
-                    total_bytes=int(total_bytes) if total_bytes is not None else None,
-                )
-            )
-
-        result: list[SmsMessage] = []
-        for message_rowid, guid, service, sender, date_value, text, attributed_body in rows:
-            if isinstance(text, str) and text:
-                message_text = text
-            else:
-                message_text = _decode_typedstream_string(attributed_body)
-            date_nanoseconds = int(date_value or 0)
-            seconds, nanoseconds = divmod(date_nanoseconds, 1_000_000_000)
-            received = _APPLE_EPOCH + timedelta(
-                seconds=seconds, microseconds=nanoseconds // 1_000
-            )
-            result.append(
-                SmsMessage(
-                    rowid=int(message_rowid),
-                    guid=str(guid) if guid is not None else str(message_rowid),
-                    service=str(service) if service is not None else None,
-                    sender=str(sender) if sender is not None else None,
-                    received_at=received.isoformat(),
-                    text=message_text,
-                    attachments=tuple(attachments[int(message_rowid)]),
-                )
-            )
-        return result
+            system_clause = "COALESCE(m.is_system_message, 0) = 0" if "is_system_message" in columns else "1"
+            service_clause = "COALESCE(m.is_service_message, 0) = 0" if "is_service_message" in columns else "1"
+            while True:
+                conditions = [system_clause, service_clause]
+                params: list[object] = []
+                if cursor is not None:
+                    conditions.append("m.ROWID < ?")
+                    params.append(cursor)
+                if direction != "all":
+                    conditions.append("m.is_from_me = ?")
+                    params.append(0 if direction == "incoming" else 1)
+                if sender:
+                    conditions.append("h.id = ?")
+                    params.append(sender)
+                if service:
+                    conditions.append("m.service = ?")
+                    params.append(service)
+                params.append(max(100, limit + 1))
+                rows = db.execute(
+                    f"SELECT m.ROWID, {guid_expr}, m.service, h.id, m.date, "
+                    f"m.text, {attributed_expr}, m.is_from_me "
+                    "FROM message AS m LEFT JOIN handle AS h ON h.ROWID = m.handle_id "
+                    f"WHERE {' AND '.join(conditions)} ORDER BY m.ROWID DESC LIMIT ?",
+                    params,
+                ).fetchall()
+                if not rows:
+                    break
+                for rowid, guid, msg_service, msg_sender, date_value, text, attributed, from_me in rows:
+                    cursor = int(rowid)
+                    message_text = text if isinstance(text, str) and text else _decode_typedstream_string(attributed)
+                    if needle and needle not in (message_text or "").casefold():
+                        continue
+                    seconds, nanoseconds = divmod(int(date_value or 0), 1_000_000_000)
+                    received = _APPLE_EPOCH + timedelta(seconds=seconds, microseconds=nanoseconds // 1_000)
+                    found.append({
+                        "id": str(guid) if guid is not None else str(rowid),
+                        "rowid": int(rowid),
+                        "service": msg_service,
+                        "sender": msg_sender,
+                        "received_at": received.isoformat(),
+                        "direction": "outgoing" if from_me else "incoming",
+                        "text": message_text,
+                    })
+                    if len(found) > limit:
+                        return found[:limit], found[limit - 1]["rowid"]
+                if len(rows) < max(100, limit + 1):
+                    break
+        return found, None

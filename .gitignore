@@ -13,3 +13,7 @@ dist/
 sms_forwarder.sqlite3
 sms_forwarder.sqlite3-shm
 sms_forwarder.sqlite3-wal
+.api_token
+.discovery_secret
+.discovery.sqlite3*
+.runtime/
